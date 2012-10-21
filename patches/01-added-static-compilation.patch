@@ -1,0 +1,25 @@
+# HG changeset patch
+# User ayufan@osk-net.pl
+# Date 1336427353 -7200
+# Node ID edd6e8e603b57e7aabe6ba498f295d5b85710ed9
+# Parent  e5106d3dac509d5e92d740deb682fc06c15b7f9e
+added static compilation
+
+diff -r e5106d3dac50 -r edd6e8e603b5 configure.in
+--- a/configure.in	Mon May 07 23:46:28 2012 +0200
++++ b/configure.in	Mon May 07 23:49:13 2012 +0200
+@@ -138,7 +138,14 @@
+ 	#include <limits.h>
+ 	#endif
+ 	]])
++	
++#
++# --enable-static
+ 
++AC_ARG_ENABLE(static, AC_HELP_STRING([--enable-static], [Enables static compilation]))
++if test "x$enable_static" = "xyes"; then
++	LDFLAGS="-static"
++fi
+ 
+ #
+ # --enable-debug
