@@ -1,0 +1,41 @@
+#!/bin/sh /etc/rc.common
+
+START=55
+PIDDIR=/var/run/
+
+service_start() {
+		local rootdir
+		local path
+		local interval
+		local proto
+		local entries
+		local enabled
+		
+		config_get rootdir $1 rootdir /tmp
+		config_get proto $1 proto tcp
+		config_get path $1 path $rootdir/$proto-%Y%m%d-%H%M%S.log.gz
+		config_get interval $1 interval 60
+		config_get entries $1 entries 100
+		config_get_bool enabled $1 enabled '1'
+		
+		[ "$enabled" -gt 0 ] && /usr/sbin/ctrecorder -C -f $path -t $interval -p $proto -B $entries -P /var/run/ctrecorder.$proto.pid
+}
+
+service_stop() {
+		local proto
+		
+		config_get proto $1 proto tcp
+		
+		PID_F=/var/run/ctrecorder.${proto}.pid
+		[ -f $PID_F ] && kill $(cat $PID_F)
+}
+
+start() {
+        config_load ctrecorder
+        config_foreach service_start record
+}
+
+stop() {
+        config_load ctrecorder
+        config_foreach service_stop record
+}
