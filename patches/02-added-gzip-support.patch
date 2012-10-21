@@ -1,0 +1,482 @@
+# HG changeset patch
+# User ayufan@osk-net.pl
+# Date 1336427536 -7200
+# Node ID f3e0a3c3e307a6954f8efc19a3b2aa0da90a21f6
+# Parent  edd6e8e603b57e7aabe6ba498f295d5b85710ed9
+added gzip support
+
+diff -r edd6e8e603b5 -r f3e0a3c3e307 configure.in
+--- a/configure.in	Mon May 07 23:49:13 2012 +0200
++++ b/configure.in	Mon May 07 23:52:16 2012 +0200
+@@ -125,7 +125,6 @@
+ 	#include <libnetfilter_conntrack/libnetfilter_conntrack.h>
+ 	]])
+ 
+-
+ #
+ # NAT support
+ #
+@@ -175,6 +174,22 @@
+ AM_CONDITIONAL(ENABLE_CAPTURE, test x$enable_capture != xno)
+ AC_MSG_NOTICE([setup: enable capture: $enable_capture])
+ 
++#
++# --disable-gzip
++
++AC_ARG_ENABLE(gzip,
++	AC_HELP_STRING([--disable-gzip], [Disable gzip file writer]))
++
++if test "x$enable_gzip" = "xno"; then
++	disable_gzip="yes"
++	AC_DEFINE(DISABLE_GZIP, 1, [Disable gzip])
++else
++	AC_CHECK_HEADERS([zlib.h])
++fi
++
++AM_CONDITIONAL(ENABLE_GZIP, test x$enable_gzip != xno)
++AC_MSG_NOTICE([setup: enable gzip: $enable_gzip])
++
+ 
+ #
+ # --enable-remake-doc
+diff -r edd6e8e603b5 -r f3e0a3c3e307 src/Makefile.am
+--- a/src/Makefile.am	Mon May 07 23:49:13 2012 +0200
++++ b/src/Makefile.am	Mon May 07 23:52:16 2012 +0200
+@@ -38,8 +38,12 @@
+ #	compat.c compat.h \
+ #	options.h
+ 
++ctrecorder_LDADD =
+ if ENABLE_CAPTURE
+-ctrecorder_LDFLAGS = -lnetfilter_conntrack
++ctrecorder_LDADD += -lnfnetlink -lnetfilter_conntrack
++endif
++if ENABLE_GZIP
++ctrecorder_LDADD += -lz
+ endif
+ ctrecorder_CFLAGS = -I${top_srcdir}/
+ ctrecorder_SOURCES = \
+diff -r edd6e8e603b5 -r f3e0a3c3e307 src/ctrecorder.c
+--- a/src/ctrecorder.c	Mon May 07 23:49:13 2012 +0200
++++ b/src/ctrecorder.c	Mon May 07 23:52:16 2012 +0200
+@@ -49,6 +49,10 @@
+ 
+ /* file name template */
+ int fd = -1;
++#ifndef DISABLE_GZIP
++gzFile gzFd = NULL;
++int gzerrno;
++#endif
+ char *fnt = NULL;
+ struct common *buffer = NULL;
+ int buffer_pos = 0;
+@@ -127,6 +131,13 @@
+ #endif
+ 
+ 	buffer_flush();
++#ifndef DISABLE_GZIP
++	if(gzFd)
++	{
++		gzclose(gzFd);
++		gzFd = NULL;
++	}
++#endif
+ 	SAFE_CLOSE(fd);
+ 	pidfile_remove(pid_file);
+ }
+@@ -202,6 +213,9 @@
+ 	struct tm stm;
+ 	char fn[1024];
+ 	int res, nfd;
++#ifndef DISABLE_GZIP
++	gzFile ngz = NULL;
++#endif
+ 
+ 	/* initialize header */
+ 	memset(&fh, 0, sizeof(fh));
+@@ -255,9 +269,30 @@
+ 		stats.rotation_fails++;
+ 		return;
+ 	}
+-
+-	log_action(LOG_INFO, "recording to %s", fn);
+-	if ((res = safe_write(nfd, &fh, sizeof(fh))) == -1) {
++	
++#ifndef DISABLE_GZIP
++	if(is_gzip(fn)) {
++		log_action(LOG_INFO, "recording gzipped to %s", fn);
++		if(!(ngz = gzdopen(nfd, "wb"))) {			
++			log_action(LOG_ERR, "gzdopen(%s): failed", fn);
++			if (fd == -1) {
++				cleanup();
++				exit(1);
++			}
++		
++			log_action(LOG_WARNING, "... writing still to old file");
++			/* give up till next try */
++			last_rotation_time = tv->tv_sec;
++			stats.rotation_fails++;
++			SAFE_CLOSE(nfd);
++			return;
++		}
++	}
++	else
++#endif
++		log_action(LOG_INFO, "recording to %s", fn);
++	
++	if ((res = safe_write(nfd, ngz, &fh, sizeof(fh))) == -1) {
+ 		log_action(LOG_ERR, "write(%s): %s", fn, strerror(errno));
+ 		cleanup();
+ 		log_stats();
+@@ -269,11 +304,19 @@
+ 		stats.rotated = time(NULL);
+ 		buffer_flush();
+ 		log_stats();
++#ifndef DISABLE_GZIP		
++		if(gzFd) {
++			gzclose(gzFd);
++		}
++#endif
+ 		SAFE_CLOSE(fd);
+ 		// if (auto_squeeze) fork(), close(...), nice(-19), sleep(5), squeeze(old_fn)
+ 	}
+ 
+ 	fd = nfd;
++#ifndef DISABLE_GZIP
++	gzFd = ngz;
++#endif
+ 	last_rotation_time = tv->tv_sec;
+ 
+ 	// combine old file to other format
+@@ -287,15 +330,25 @@
+ 
+ 	if (fd == -1 || !buffer_pos)
+ 		return;
+-
++		
++#ifndef DISABLE_GZIP
++	if ((res = safe_write(fd, gzFd, buffer, buffer_pos * sizeof(*buffer))) == -1) {
++#else
+ 	if ((res = safe_write(fd, buffer, buffer_pos * sizeof(*buffer))) == -1) {
++#endif
+ 		log_action(LOG_ERR, "write(%d): %s", buffer_pos, strerror(errno));
+ 		stats.write_errors += buffer_pos;
+ 	} else {
+ //		log_action(LOG_DEBUG | LOG_FORE_ONLY, "write(%d): %d", buffer_pos, res);
+ 		stats.flushed += buffer_pos;
++
++#ifndef DISABLE_GZIP
++		if(gzFd) {
++			gzflush(gzFd, 0);
++		}
++#endif
+ 	}
+-
++	
+ 	buffer_pos = 0;
+ }
+ 
+@@ -496,7 +549,10 @@
+ void read_events(char* fn, u_int32_t net, u_int32_t mask, u_int16_t port, char* date)
+ {
+ 	struct common_list **cache = NULL;
+-	FILE *file;
++	FILE *file = NULL;
++#ifndef DISABLE_GZIP	
++	gzFile gzFile = NULL;
++#endif
+ 
+ 	net = net & mask;
+ 	inline int ipmatch(struct orig_repl a)
+@@ -515,13 +571,26 @@
+ 	{
+ 		return (_port == a.orig.src.port) || (_port == a.orig.dst.port) || (_port == a.repl.src.port) || (_port == a.repl.dst.port);
+ 	}
+-
++	
++	int read_file(void* buf, size_t s, size_t n)
++	{
++#ifndef DISABLE_GZIP	
++		if(gzFile) {
++			int r = gzread(gzFile, buf, s * n);			if(r < 0)
++				return r;
++			return r / s;
++		}
++		else
++#endif
++			return fread(buf, s, n, file);
++	}
++	
+ 	void show_common()
+ 	{
+ 		struct common buf[65536];
+ 		int n, i;
+ 		for (;;) {
+-			if ((n = fread(&buf, sizeof(struct common), sizeof(buf)/sizeof(struct common), file)) <= 0)
++			if ((n = read_file(&buf, sizeof(struct common), sizeof(buf)/sizeof(struct common))) <= 0)
+ 				break;
+ 
+ 			for (i=0; i<n; i++) {
+@@ -581,7 +650,7 @@
+ 		int n, i;
+ 
+ 		for (;;) {
+-			if ((n = fread(&buf, sizeof(struct combined), sizeof(buf)/sizeof(struct combined), file)) <= 0)
++			if ((n = read_file(&buf, sizeof(struct combined), sizeof(buf)/sizeof(struct combined))) <= 0)
+ 				break;
+ 
+ 			for (i=0; i<n; i++) {
+@@ -596,11 +665,20 @@
+ 		}
+ 	}
+ 
+-	if (!(file = fopen(fn, "r")))
+-		die(1, "fopen: %m");
+-
++#ifndef DISABLE_GZIP
++	if(is_gzip(fn)) {
++		if (!(gzFile = gzopen(fn, "rb")))
++			die(1, "gzopen: %m");
++	}
++	else 
++#endif
++	{
++		if (!(file = fopen(fn, "rb")))
++			die(1, "fopen: %m");
++	}
++	
+ 	struct file_header fh;
+-	if (fread(&fh, sizeof(fh), 1, file) != 1)
++	if (read_file(&fh, sizeof(fh), 1) != 1)
+ 		die(1, "fread: %m");
+ 
+ 	TERMINATE_STRING(fh.hostname);
+@@ -629,7 +707,12 @@
+ 		die(1, "Invalid fh.flags");
+ 
+ 	if (header_only) {
+-		fclose(file);
++#ifndef DISABLE_GZIP
++		if(gzFile)
++			gzclose(gzFile);
++		else
++#endif
++			fclose(file);
+ 		return;
+ 	}
+ 
+@@ -643,10 +726,23 @@
+ 	else
+ 		show_common();
+ 
++#ifndef DISABLE_GZIP
++	if(gzFile) {
++		const char* txt = gzerror(file, &gzerrno);
++		if(gzerrno != Z_STREAM_END && gzerrno != Z_OK)
++			fprintf(stderr, "gzerror(input): %s\n", txt);
++	}
++	else
++#endif
+ 	if (ferror(file))
+ 		fprintf(stderr, "read error: %d\n", ferror(file));
+ 
+-	fclose(file);
++#ifndef DISABLE_GZIP
++	if(gzFile)
++		gzclose(gzFile);
++	else
++#endif
++		fclose(file);
+ }
+ 
+ // output == NULL => squeeze "in place"
+@@ -659,18 +755,44 @@
+ 	struct common_list **cache = NULL;
+ 	struct common buf[65536];
+ 	struct file_header fh;
+-	FILE *file, *out;
++	FILE *file = NULL, *out = NULL;
++#ifndef DISABLE_GZIP	
++	gzFile gzFile = NULL;
++#endif
+ 	int n, i;
+ 
+ 
+ 	if ((cache = calloc(HASH_SIZE, sizeof(*cache))) == NULL)
+ 		die(1, "calloc(cache): %m");
+ 
+-	if (!(file = fopen(input, "r")))
+-		die(1, "fopen(input): %m");
+-
+-	if (fread(&fh, sizeof(fh), 1, file) != 1)
+-		die(1, "fread(input): %m");
++#ifndef DISABLE_GZIP		
++	if(is_gzip(input)) {
++		if (!(gzFile = gzopen(input, "rb")))
++			die(1, "gzopen(input): %m");
++	}
++	else 
++#endif
++	{
++		if (!(file = fopen(input, "r")))
++			die(1, "fopen(input): %m");
++	}
++	
++	int read_file(void* buf, size_t s, size_t n)
++	{
++#ifndef DISABLE_GZIP	
++		if(gzFile) {
++			int r = gzread(gzFile, buf, s * n);
++			if(r < 0)
++				return r;
++			return r / s;
++		}
++		else
++#endif
++			return fread(buf, s, n, file);
++	}
++	
++	if (read_file(&fh, sizeof(fh), 1) != 1)
++		die(1, "read(input): %m");
+ 
+ 	if (fh.magic != htonl(CTEVENTLOG_MAGIC))
+ 		die(1, "Invalid fh.magic");
+@@ -701,7 +823,7 @@
+ 	memset(&c, '\0', sizeof(c));
+ 
+ 	for (;;) {
+-		if ((n = fread(&buf, sizeof(struct common), sizeof(buf)/sizeof(struct common), file)) <= 0)
++		if ((n = read_file(&buf, sizeof(struct common), sizeof(buf)/sizeof(struct common))) <= 0)
+ 			break;
+ 
+ 		for (i=0; i<n; i++) {
+@@ -741,13 +863,26 @@
+ 		}
+ 	}
+ 
++#ifndef DISABLE_GZIP
++	if(gzFile) {
++		const char* txt = gzerror(file, &gzerrno);
++		if(gzerrno != Z_STREAM_END && gzerrno != Z_OK)
++			fprintf(stderr, "gzerror(input): %s\n", txt);
++	}
++	else
++#endif
+ 	if (ferror(file))
+ 		fprintf(stderr, "ferror(input): %d\n", ferror(file));
+ 
+ 	if (ferror(out))
+ 		fprintf(stderr, "ferror(output): %d\n", ferror(file));
+-
+-	fclose(file);
++		
++#ifndef DISABLE_GZIP
++	if(gzFile)
++		gzclose(gzFile);
++	else
++#endif
++		fclose(file);
+ 	fclose(out);
+ }
+ 
+@@ -770,6 +905,11 @@
+ #else
+ 	printf("Capture mode support: yes\n");
+ #endif
++#ifdef DISABLE_GZIP
++	printf("Gzip mode support: disabled at compilation time!\n");
++#else
++	printf("Gzip mode support: yes (include .gz at end of output file)\n");
++#endif
+ #ifdef HAVE_DECL_ATTR_TIMESTAMP_START
+ 	printf("Timestamping support: yes\n");
+ #else
+@@ -782,11 +922,14 @@
+ void usage(int code) __attribute__((noreturn));
+ void usage(int code)
+ {
+-	printf("Usage: ctrecord [ -C | -L | -T | -S | -h | -V ] options ...\n");
+-	printf("capture mode: ctrecord -C ...");
++	printf("Usage: ctrecorder [ -C | -L | -T | -S | -h | -V ] options ...\n");
++	printf("capture mode: ctrecorder -C ...");
+ #ifdef DISABLE_CAPTURE
+ 	printf(" (disabled at compilation time)");
+ #endif
++#ifdef DISABLE_GZIP
++	printf(" (disabled gzip support)");
++#endif
+ 	printf("\n");
+ 	printf("  -f path          output filename, conforming to strftime format, ex. /tmp/ct-%%Y%%m%%d-%%H%%M%%S.log\n");
+ 	printf("  -t minutes       output name change interval\n");
+diff -r edd6e8e603b5 -r f3e0a3c3e307 src/util.c
+--- a/src/util.c	Mon May 07 23:49:13 2012 +0200
++++ b/src/util.c	Mon May 07 23:52:16 2012 +0200
+@@ -581,6 +581,7 @@
+  * may cause desync on some errno-s
+ */
+ 
++#ifdef DISABLE_GZIP
+ ssize_t safe_write(int fd, const void *buf, size_t count)
+ {
+ 	int res;
+@@ -593,7 +594,20 @@
+ 	} while (count > 0);
+ 	return res;
+ } /* safe_write() */
+-
++#else
++ssize_t safe_write(int fd, gzFile gz, const void *buf, size_t count)
++{
++	int res;
++	do {
++		res = gz ? gzwrite(gz, buf, count) : write(fd, buf, count);
++		if (res == -1 && errno == EINTR)
++			continue;
++		buf += res;
++		count -= res;
++	} while (count > 0);
++	return res;
++} /* safe_write() */
++#endif
+ 
+ /*
+  * 	(sys)logging
+@@ -1226,3 +1240,12 @@
+ }
+ #endif
+ 
++#ifndef DISABLE_GZIP
++int is_gzip(const char *path)
++{
++	int len = path ? strlen(path) : 0;
++	if(path < 3)
++		return 0;
++	return strcmp(path + len - 3, ".gz") == 0;
++}
++#endif
+diff -r edd6e8e603b5 -r f3e0a3c3e307 src/util.h
+--- a/src/util.h	Mon May 07 23:49:13 2012 +0200
++++ b/src/util.h	Mon May 07 23:52:16 2012 +0200
+@@ -28,6 +28,9 @@
+ #include <syslog.h>
+ #include <netinet/in.h>
+ #include <errno.h>
++#ifndef DISABLE_GZIP
++#include <zlib.h>
++#endif
+ #ifdef HAVE_SYS_RESOURCE_H
+ #include <sys/resource.h>
+ #endif
+@@ -259,7 +262,12 @@
+ EXTERN int connect_host_from_port(struct sockaddr_in dst, int dst_port, struct sockaddr_in src, int socket_options[], int ip_options[]);
+ EXTERN int setup_socket_in(int proto, in_addr_t ip, int port, int backlog, int socket_options[], int ip_options[]);
+ EXTERN int setup_socket(int proto, char *addr, int port, int backlog, int socket_options[], int ip_options[]);
++#ifdef DISABLE_GZIP
+ EXTERN ssize_t safe_write(int fd, const void *buf, size_t count);
++#else
++EXTERN ssize_t safe_write(int fd, gzFile gz, const void *buf, size_t count);
++EXTERN int is_gzip(const char *path);
++#endif
+ 
+ EXTERN void die(int code, char *format, ...)
+ 	__attribute__ ((format (printf, 2, 3)))
